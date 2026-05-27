@@ -187,7 +187,7 @@ async def scrape_stake_page(page, url: str, sport_name: str, max_matches: int) -
                 });
                 // Simple heuristic: look for lines with "v", "vs", "-" between team-like words
                 for (const text of texts) {
-                    const vsMatch = text.match(/([A-Za-z0-9][A-Za-z0-9\s]{2,30})\s+[vV\-]\s+([A-Za-z0-9][A-Za-z0-9\s]{2,30})/);
+                    const vsMatch = text.match(/([A-Za-z0-9][A-Za-z0-9\\s]{2,30})\\s+[vV\\-]\\s+([A-Za-z0-9][A-Za-z0-9\\s]{2,30})/);
                     if (vsMatch) {
                         data.push({team1: vsMatch[1].trim(), team2: vsMatch[2].trim(), raw: text});
                     }
@@ -237,15 +237,10 @@ async def main() -> None:
                 ]
             }
 
-            # Proxy setup
-            if proxy_config:
-                try:
-                    proxy = await actor.create_proxy_configuration(proxy_config)
-                    url = await proxy.new_url()
-                    launch_args["proxy"] = {"server": url}
-                    actor.log.info(f"Using proxy: {url[:50]}...")
-                except Exception as e:
-                    actor.log.warning(f"Proxy setup failed: {e}")
+            # Proxy: always use Oxylabs residential with AU targeting for Stake
+            proxy_url = "http://numbnuts_9kOSG-country-AU:~SWmnT7Qe~n7Fi@pr.oxylabs.io:7777"
+            launch_args["proxy"] = {"server": proxy_url}
+            actor.log.info("Using Oxylabs AU proxy")
 
             browser = await p.chromium.launch(**launch_args)
             context = await browser.new_context(
