@@ -6,8 +6,7 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Proxy settings (Apify proxy or custom)",
-      "default": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"]}
+      "editor": "proxy"
     },
     "maxMatches": {
       "title": "Max matches",
