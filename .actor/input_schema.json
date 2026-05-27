@@ -6,6 +6,7 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
+      "description": "Proxy settings",
       "editor": "proxy"
     },
     "maxMatches": {
