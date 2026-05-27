@@ -238,7 +238,7 @@ async def main() -> None:
             }
 
             # Proxy: always use Oxylabs residential with AU targeting for Stake
-            proxy_url = "http://numbnuts_9kOSG-country-AU:~SWmnT7Qe~n7Fi@pr.oxylabs.io:7777"
+            proxy_url = "http://customer-numbnuts_9kOSG-country-AU:~SWmnT7Qe~n7Fi@pr.oxylabs.io:7777"
             launch_args["proxy"] = {"server": proxy_url}
             actor.log.info("Using Oxylabs AU proxy")
 
