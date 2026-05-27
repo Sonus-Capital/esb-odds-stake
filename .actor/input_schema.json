@@ -1,0 +1,32 @@
+{
+  "title": "Stake.com Odds Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Proxy settings (Apify proxy or custom)",
+      "default": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"]}
+    },
+    "maxMatches": {
+      "title": "Max matches",
+      "type": "integer",
+      "description": "Maximum matches to scrape per sport",
+      "default": 200
+    },
+    "includeLive": {
+      "title": "Include live",
+      "type": "boolean",
+      "description": "Also scrape live/inplay matches",
+      "default": true
+    },
+    "headless": {
+      "title": "Headless mode",
+      "type": "boolean",
+      "description": "Run browser headless (disable for debugging)",
+      "default": true
+    }
+  },
+  "required": []
+}

@@ -1,0 +1,10 @@
+{
+  "actorSpecification": 1,
+  "name": "esb-odds-stake",
+  "title": "ESB Odds - Stake.com",
+  "description": "Scrape esports match odds from Stake.com using Playwright + stealth",
+  "version": "1.0",
+  "buildTag": "latest",
+  "input": "./.actor/input_schema.json",
+  "dockerfile": "./Dockerfile"
+}
