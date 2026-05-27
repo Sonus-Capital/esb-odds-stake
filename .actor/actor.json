@@ -5,6 +5,6 @@
   "description": "Scrape esports match odds from Stake.com using Playwright + stealth",
   "version": "1.0",
   "buildTag": "latest",
-  "input": "./.actor/input_schema.json",
+  "input": "./input_schema.json",
   "dockerfile": "./Dockerfile"
 }
