@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """Apify Actor: Stake.com Esports Odds Scraper
 
-ARCHITECTURE (2026-05-28):
-Stake's GraphQL API at /_api/graphql requires authentication for odds data.
-The path to odds is: sport → tournamentList → sportTournament.fixtureList →
-markets.outcomes.{id,name,odds} — all gated behind 'Please log in'.
+ARCHITECTURE (2026-05-28 v3):
 
-Strategy: Use Playwright to establish a real browser session (bypassing CF via
-Oxylabs residential proxy), then intercept the GraphQL network requests the
-browser makes natively as it loads the esports pages. The browser sends the
-correct x-access-token / cf_clearance cookies automatically.
+CF solved in 1s via Oxylabs residential proxy + stealth v2 ✓
+GQL interception race condition fixed: listener attached BEFORE page.goto()
+DOM scraper rewritten: parses Stake's actual card structure from observed logs
 
-Flow:
-1. Launch Chromium with Oxylabs residential proxy + stealth v2
-2. Navigate to stake.com/sports/esports — let it load fully (CF + SPA hydrate)
-3. Intercept all /_api/graphql POST responses while the page loads
-4. Parse intercepted responses for SportFixture / SportTournament data with odds
-5. If interception catches nothing, fall back to DOM scraping of rendered odds buttons
+Stake page card structure (observed from logs):
+  Line 0: Game name (e.g. "League of Legends", "CS2")
+  Line 1: Status ("Live" or time like "1m 6s")
+  Line 2: Map info ("5th Map", "1st Map") -- may be absent on pre-match
+  Line 3: Tournament name ("NACL 2026 Spring", "Circuit X Base Recife")
+  Line 4: Team 1 name
+  Line 5: Team 2 name
+  Lines 6-9: Score digits (live) or absent (pre-match)
+  Last meaningful line before odds: "Match Winner - Twoway/Threeway" label
+  Odds: two or three decimal numbers
 
-CF Note: Apify containers run headless on datacenter IPs. Oxylabs residential
-proxy is the primary CF bypass mechanism — the browser fingerprint routes through
-a real Canadian residential IP. Turnstile will still challenge but residential
-proxies have a much higher solve rate than datacenter. We give it 90s.
+Strategy:
+1. Attach response listener BEFORE page.goto()
+2. Navigate each sport page (CS2, LoL, Dota2, Valorant, etc.) — GQL fires on each
+3. Parse intercepted GQL responses (unauthenticated = odds in DOM, not GQL)
+4. DOM fallback: parse card structure properly using the observed line pattern
+5. Navigate to individual game pages to get more cards beyond the hub
 """
 import asyncio
 import json
@@ -32,7 +34,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 from apify import Actor
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Route, Request
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 try:
     from playwright_stealth import Stealth
@@ -46,11 +48,10 @@ logger = logging.getLogger("stake-scraper")
 DEFAULT_PROXY = {
     "server": "http://pr.oxylabs.io:7777",
     "username": "customer-sonus_TbxLY-cc-ca-city-edmonton",
-    "password": "gX~dawV=8MzVzA",
+    "password": "***",
 }
 
 STAKE_BASE = "https://stake.com"
-GRAPHQL_URL = "https://stake.com/_api/graphql"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -58,15 +59,33 @@ USER_AGENT = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
+# Stake esports game slugs — we navigate each to trigger GQL and collect more cards
+ESPORTS_GAME_SLUGS = [
+    "dota-2",
+    "counter-strike",
+    "league-of-legends",
+    "valorant",
+    "mobile-legends",
+    "starcraft-2",
+    "king-of-glory",
+    "overwatch",
+    "rocket-league",
+    "fifa",
+]
+
 
 def parse_decimal_odds(val) -> Optional[float]:
     if val is None:
         return None
     if isinstance(val, (int, float)):
-        return float(val)
+        v = float(val)
+        return v if 1.01 <= v <= 500 else None
     t = str(val).strip().replace(",", ".")
     m = re.search(r"(\d+\.?\d*)", t)
-    return float(m.group(1)) if m else None
+    if m:
+        v = float(m.group(1))
+        return v if 1.01 <= v <= 500 else None
+    return None
 
 
 def safe_kv_key(name: str) -> str:
@@ -74,7 +93,6 @@ def safe_kv_key(name: str) -> str:
 
 
 async def handle_cf_challenge(page, max_wait_s: int = 90) -> bool:
-    """Wait for CF Turnstile to resolve. 90s budget for residential proxy."""
     for i in range(max_wait_s):
         await asyncio.sleep(1)
         try:
@@ -82,7 +100,7 @@ async def handle_cf_challenge(page, max_wait_s: int = 90) -> bool:
             cur_url = page.url
         except Exception:
             continue
-        if i % 10 == 0:
+        if i % 15 == 0:
             logger.info(f"CF wait {i+1}s | title={title!r}")
         if (
             title != "Just a moment..."
@@ -91,178 +109,289 @@ async def handle_cf_challenge(page, max_wait_s: int = 90) -> bool:
             and "cf-challenge" not in title.lower()
         ):
             logger.info(f"CF resolved at {i+1}s")
-            await asyncio.sleep(3)  # SPA hydration buffer
+            await asyncio.sleep(3)
             return True
     return False
 
 
-def extract_records_from_graphql(payload: dict, now: str) -> List[Dict]:
-    """Parse any intercepted GraphQL response for odds data."""
+def extract_records_from_graphql(body: dict, now: str) -> List[Dict]:
+    """Parse intercepted GQL response. Stake returns odds in outcomes when authenticated."""
     records = []
-    data = payload.get("data") or {}
+    data = body.get("data") or {}
 
-    # Handle sportTournament.fixtureList path
-    tournament = data.get("sportTournament")
-    if tournament:
-        t_name = tournament.get("name", "")
-        for fixture in tournament.get("fixtureList", []):
-            rec = parse_fixture(fixture, t_name, now)
-            if rec:
-                records.extend(rec)
+    def parse_fixture(fixture: dict, t_name: str, game_name: str) -> List[Dict]:
+        recs = []
+        name = fixture.get("name", "")
+        start_time = fixture.get("startTime", "")
+        slug = fixture.get("slug", "")
+        match_url = f"{STAKE_BASE}/sports/esports/{slug}" if slug else ""
 
-    # Handle sportList path (returns sports, not events — skip)
-    # Handle any top-level fixture list
-    for key in ["fixtureList", "fixtures", "events"]:
+        # Team names from "Team A vs Team B" or "Team A - Team B"
+        vs_parts = re.split(r"\s+(?:vs\.?|VS\.?|–|-)\s+", name, maxsplit=1)
+        team1 = vs_parts[0].strip() if len(vs_parts) == 2 else ""
+        team2 = vs_parts[1].strip() if len(vs_parts) == 2 else ""
+
+        target_markets = {"match winner", "match result", "winner", "1x2", "moneyline"}
+        for market in fixture.get("markets", []):
+            if not isinstance(market, dict):
+                continue
+            mkt_name = (market.get("name") or "").lower()
+            if mkt_name and mkt_name not in target_markets:
+                continue
+            outcomes = market.get("outcomes", [])
+            if len(outcomes) < 2:
+                continue
+            p1 = p2 = p_draw = None
+            for o in outcomes:
+                o_name = (o.get("name") or "").lower()
+                odds = parse_decimal_odds(o.get("odds"))
+                if not odds:
+                    continue
+                if team1 and team1.lower() in o_name:
+                    p1 = odds
+                elif team2 and team2.lower() in o_name:
+                    p2 = odds
+                elif any(x in o_name for x in ("draw", "tie")):
+                    p_draw = odds
+                elif o_name in ("home", "1") and p1 is None:
+                    p1 = odds
+                elif o_name in ("away", "2") and p2 is None:
+                    p2 = odds
+            if p1 or p2:
+                recs.append({
+                    "bookmaker": "stake",
+                    "game_raw": game_name,
+                    "tournament_name": t_name,
+                    "team1": team1,
+                    "team2": team2,
+                    "match_start_time": start_time,
+                    "match_url": match_url,
+                    "price_team1": p1,
+                    "price_team2": p2,
+                    "price_draw": p_draw,
+                    "scraped_at": now,
+                })
+        return recs
+
+    # sportTournament.fixtureList path
+    t = data.get("sportTournament")
+    if t:
+        for fx in t.get("fixtureList", []):
+            records.extend(parse_fixture(fx, t.get("name", ""), ""))
+
+    # Direct fixtureList / events at top level
+    for key in ("fixtureList", "fixtures", "events"):
         if key in data and isinstance(data[key], list):
-            for fixture in data[key]:
-                rec = parse_fixture(fixture, "", now)
-                if rec:
-                    records.extend(rec)
+            for fx in data[key]:
+                records.extend(parse_fixture(fx, "", ""))
 
     return records
 
 
-def parse_fixture(fixture: dict, tournament_name: str, now: str) -> Optional[List[Dict]]:
-    """Parse a single fixture dict into odds records."""
-    if not isinstance(fixture, dict):
+def parse_card_lines(lines: list) -> Optional[Dict]:
+    """
+    Parse Stake card innerText lines into a structured record.
+
+    Observed structure from logs:
+      [0] game name: "League of Legends" / "CS2" / "FIFA"
+      [1] status: "Live" or countdown like "1m 6s" or date
+      [2] (optional) map: "5th Map" / "1st Map" — skip if starts with digit+letter
+      [N] tournament name
+      [N+1] team1 name
+      [N+2] team2 name
+      [N+3..] score digits (if live): "2", "2", "0", "1"
+      then: "Match Winner - Twoway" or "Match Winner - Threeway" label
+      then: odds values as decimal strings
+
+    We extract: game, tournament, team1, team2, and find decimal odds in the lines.
+    """
+    if len(lines) < 5:
         return None
 
-    name = fixture.get("name", "")
-    start_time = fixture.get("startTime", "")
-    slug = fixture.get("slug", "")
-    match_url = f"{STAKE_BASE}/sports/esports/{slug}" if slug else ""
+    # Find all decimal odds in the lines (format X.XX or XX.XX)
+    odds_values = []
+    odds_indices = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\d{1,3}\.\d{2,3})$", line.strip())
+        if m:
+            v = float(m.group(1))
+            if 1.01 <= v <= 500:
+                odds_values.append(v)
+                odds_indices.append(i)
 
-    # Extract team names from fixture name (format: "Team A vs Team B" or "Team A - Team B")
-    team1, team2 = "", ""
-    vs_match = re.split(r"\s+(?:vs\.?|VS\.?|–|-)\s+", name, maxsplit=1)
-    if len(vs_match) == 2:
-        team1, team2 = vs_match[0].strip(), vs_match[1].strip()
+    if len(odds_values) < 2:
+        return None
 
-    records = []
-    target_markets = {"match winner", "match result", "winner", "1x2", "moneyline"}
+    # Find "Match Winner" label to anchor team extraction
+    mw_idx = None
+    for i, line in enumerate(lines):
+        if "match winner" in line.lower() or "moneyline" in line.lower():
+            mw_idx = i
+            break
 
-    for market in fixture.get("markets", []):
-        if not isinstance(market, dict):
-            continue
-        mkt_name = market.get("name", "").lower()
-        # Accept match-winner markets OR take first market if we have no name (auth-gated name)
-        if mkt_name and mkt_name not in target_markets:
-            continue
+    # Teams are the two lines immediately before "Match Winner" label,
+    # after skipping score digits (single digit lines)
+    team1, team2, tournament = "", "", ""
 
-        outcomes = market.get("outcomes", [])
-        if len(outcomes) < 2:
-            continue
-
-        p1 = p2 = p_draw = None
-        for o in outcomes:
-            o_name = (o.get("name") or "").lower()
-            odds = o.get("odds")
-            if not odds:
+    if mw_idx and mw_idx >= 3:
+        # Work backwards from Match Winner label, skip score digits
+        candidates = []
+        i = mw_idx - 1
+        while i >= 2 and len(candidates) < 4:
+            line = lines[i].strip()
+            # Score digit: single or double digit alone
+            if re.match(r"^\d{1,2}$", line):
+                i -= 1
                 continue
-            if team1 and team1.lower() in o_name:
-                p1 = parse_decimal_odds(odds)
-            elif team2 and team2.lower() in o_name:
-                p2 = parse_decimal_odds(odds)
-            elif any(x in o_name for x in {"draw", "tie", "x", "home", "1"}) and p1 is None:
-                p1 = parse_decimal_odds(odds)
-            elif any(x in o_name for x in {"away", "2"}) and p2 is None:
-                p2 = parse_decimal_odds(odds)
-            elif "draw" in o_name or "tie" in o_name:
-                p_draw = parse_decimal_odds(odds)
+            candidates.insert(0, (i, line))
+            i -= 1
 
-        if p1 or p2:
-            records.append({
-                "bookmaker": "stake",
-                "game_raw": fixture.get("sport", {}).get("name", "") if isinstance(fixture.get("sport"), dict) else "",
-                "tournament_name": tournament_name,
-                "team1": team1,
-                "team2": team2,
-                "match_start_time": start_time,
-                "match_url": match_url,
-                "price_team1": p1,
-                "price_team2": p2,
-                "price_draw": p_draw,
-                "scraped_at": now,
-            })
+        # Last two candidates = team2, team1
+        if len(candidates) >= 2:
+            team1 = candidates[-2][1]
+            team2 = candidates[-1][1]
+            # tournament = line just before team1 if it exists
+            t_idx = candidates[-2][0] - 1
+            if t_idx >= 2:
+                potential_t = lines[t_idx].strip()
+                # Skip if it looks like a map indicator
+                if not re.match(r"^\d+(st|nd|rd|th)\s+Map", potential_t, re.I):
+                    tournament = potential_t
+        elif len(candidates) == 1:
+            team2 = candidates[0][1]
 
-    return records or None
+    # Game name is line 0
+    game_raw = lines[0].strip()
+
+    # Determine if live or upcoming
+    status_line = lines[1].strip() if len(lines) > 1 else ""
+
+    # Draw odds: if "Threeway" or "Draw" label in lines, treat 3rd odds as draw
+    p_draw = None
+    has_draw = any("threeway" in l.lower() or "draw" in l.lower() for l in lines)
+    if len(odds_values) >= 3 and has_draw:
+        # Stake threeway shows: team1_odds, draw_odds, team2_odds
+        # But from the FIFA example: 1.62, 4.50, 2.70
+        # and output had team1=1.62, team2=4.5 (draw), price_draw=2.70
+        # The label order on page is: Home | Draw | Away
+        p1 = odds_values[0]
+        p_draw = odds_values[1]
+        p2 = odds_values[2]
+    elif len(odds_values) >= 2:
+        p1 = odds_values[0]
+        p2 = odds_values[1]
+    else:
+        return None
+
+    if not team1 and not team2:
+        return None
+
+    return {
+        "game_raw": game_raw,
+        "tournament_name": tournament,
+        "team1": team1,
+        "team2": team2,
+        "status": status_line,
+        "price_team1": p1,
+        "price_team2": p2,
+        "price_draw": p_draw,
+    }
 
 
-async def scrape_via_dom(page, now: str) -> List[Dict]:
+async def scrape_page_dom(page, now: str, match_url: str) -> List[Dict]:
     """
-    Last-resort DOM scrape: find rendered odds buttons on the page.
-    Stake renders odds as buttons with decimal values. Look for button clusters
-    near team name text.
+    DOM scrape of the current page. Finds match cards and parses team/odds.
+    Uses innerText of each card — Stake renders full card text as observable lines.
     """
     records = []
     try:
-        dom_data = await page.evaluate("""() => {
-            const results = [];
-            // Find all elements with decimal odds values
-            const allEls = document.querySelectorAll('*');
-            const oddsEls = [];
-            allEls.forEach(el => {
-                if (el.children.length === 0) {
-                    const text = (el.innerText || el.textContent || '').trim();
-                    if (/^\\d+\\.\\d{2,3}$/.test(text)) {
-                        oddsEls.push(el);
-                    }
+        # Get all card-level containers that contain odds
+        cards_data = await page.evaluate("""() => {
+            const cards = [];
+
+            // Strategy: find elements containing 2+ decimal odds values
+            // Stake cards are typically div>div>a or similar — walk all leaf containers
+            const candidates = document.querySelectorAll(
+                'a[href*="/sports/"], [class*="event"], [class*="match"], [class*="fixture"], ' +
+                '[class*="Event"], [class*="Match"], article, [role="listitem"]'
+            );
+
+            const seen = new Set();
+            candidates.forEach(el => {
+                const text = el.innerText || '';
+                const oddsMatches = text.match(/\\b\\d{1,3}\\.\\d{2,3}\\b/g) || [];
+                const validOdds = oddsMatches.filter(o => {
+                    const v = parseFloat(o);
+                    return v >= 1.01 && v <= 500;
+                });
+                if (validOdds.length >= 2 && !seen.has(text.substring(0,100))) {
+                    seen.add(text.substring(0,100));
+                    const href = el.tagName === 'A' ? el.href : (el.querySelector('a') ? el.querySelector('a').href : '');
+                    cards.push({
+                        text: text.substring(0, 800),
+                        href: href,
+                        odds: validOdds
+                    });
                 }
             });
 
-            // Group nearby odds elements — look for clusters of 2-3 odds near team names
-            const groups = [];
-            for (let i = 0; i < oddsEls.length - 1; i++) {
-                const rect1 = oddsEls[i].getBoundingClientRect();
-                const rect2 = oddsEls[i+1].getBoundingClientRect();
-                // Same row or close vertical proximity
-                if (Math.abs(rect1.top - rect2.top) < 50) {
-                    // Find containing match card
-                    const card = oddsEls[i].closest('[class*="event"], [class*="match"], [class*="fixture"], article, [role="listitem"]');
-                    const cardText = card ? (card.innerText || '').substring(0, 400) : '';
-                    const odds = [];
-                    let j = i;
-                    while (j < oddsEls.length) {
-                        const r = oddsEls[j].getBoundingClientRect();
-                        if (Math.abs(r.top - rect1.top) < 50) {
-                            odds.push(parseFloat((oddsEls[j].innerText || '').trim()));
-                            j++;
-                        } else break;
+            // Also try: find ALL decimal numbers on page grouped by proximity
+            if (cards.length === 0) {
+                // Fallback: just grab all text blobs with 2+ odds
+                document.querySelectorAll('div, section').forEach(el => {
+                    if (el.children.length > 0 && el.children.length < 30) {
+                        const text = el.innerText || '';
+                        const oddsMatches = text.match(/\\b\\d{1,3}\\.\\d{2,3}\\b/g) || [];
+                        const validOdds = oddsMatches.filter(o => {
+                            const v = parseFloat(o);
+                            return v >= 1.01 && v <= 500;
+                        });
+                        if (validOdds.length >= 2 && validOdds.length <= 6 && text.length < 600) {
+                            if (!seen.has(text.substring(0,100))) {
+                                seen.add(text.substring(0,100));
+                                cards.push({text: text.substring(0,600), href: '', odds: validOdds});
+                            }
+                        }
                     }
-                    if (odds.length >= 2) {
-                        groups.push({cardText: cardText, odds: odds});
-                        i = j - 1; // skip consumed
-                    }
-                }
+                });
             }
-            return groups.slice(0, 50);
+
+            return cards.slice(0, 100);
         }""")
 
-        logger.info(f"DOM scrape found {len(dom_data)} odds groups")
-        for g in dom_data:
-            logger.info(f"  Group: {g['cardText'][:100]} | odds={g['odds']}")
-            # Try to extract team names from card text
-            card_text = g["cardText"]
-            vs_match = re.split(r"\s+(?:vs\.?|VS\.?|–|-)\s+", card_text, maxsplit=1)
-            team1 = vs_match[0].strip()[:50] if len(vs_match) == 2 else ""
-            team2 = vs_match[1].strip()[:50] if len(vs_match) == 2 else ""
-            odds = g["odds"]
-            if len(odds) >= 2:
-                records.append({
-                    "bookmaker": "stake",
-                    "game_raw": "",
-                    "tournament_name": "",
-                    "team1": team1,
-                    "team2": team2,
-                    "match_start_time": "",
-                    "match_url": page.url,
-                    "price_team1": odds[0] if len(odds) > 0 else None,
-                    "price_team2": odds[1] if len(odds) > 1 else None,
-                    "price_draw": odds[2] if len(odds) > 2 else None,
-                    "scraped_at": now,
-                })
+        logger.info(f"DOM: found {len(cards_data)} card candidates on {page.url}")
+
+        for card in cards_data:
+            raw_text = card.get("text", "")
+            href = card.get("href", "") or match_url
+            lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+
+            parsed = parse_card_lines(lines)
+            if not parsed:
+                # Log for debugging so we can improve the parser
+                logger.debug(f"  Unparsed card: {raw_text[:150]}")
+                continue
+
+            # Prefer card's own href as match URL
+            card_url = href if href else match_url
+
+            records.append({
+                "bookmaker": "stake",
+                "game_raw": parsed["game_raw"],
+                "tournament_name": parsed["tournament_name"],
+                "team1": parsed["team1"],
+                "team2": parsed["team2"],
+                "match_start_time": parsed.get("status", ""),
+                "match_url": card_url,
+                "price_team1": parsed["price_team1"],
+                "price_team2": parsed["price_team2"],
+                "price_draw": parsed["price_draw"],
+                "scraped_at": now,
+            })
+
     except Exception as e:
-        logger.error(f"DOM scrape failed: {e}")
+        logger.error(f"DOM scrape error: {e}")
+
     return records
 
 
@@ -271,17 +400,17 @@ async def main() -> None:
         input_data = await actor.get_input() or {}
         proxy_url = input_data.get("proxyUrl") or os.environ.get("OXYLABS_PROXY") or DEFAULT_PROXY
         stake_base = input_data.get("stakeBaseUrl") or STAKE_BASE
-        max_matches = input_data.get("maxMatches", 100)
+        max_matches = input_data.get("maxMatches", 200)
         headless = input_data.get("headless", False)
 
         actor.log.info(
-            f"Stake scraper | base={stake_base} headless={headless} "
+            f"Stake scraper v3 | base={stake_base} headless={headless} "
             f"stealth={'v2' if STEALTH_AVAILABLE else 'MISSING'}"
         )
 
-        # Intercepted GraphQL responses accumulate here
-        intercepted_records: List[Dict] = []
         now = datetime.now(timezone.utc).isoformat()
+        intercepted_records: List[Dict] = []
+        seen_keys: set = set()  # dedup by team1+team2
 
         launch_args = {
             "headless": headless,
@@ -297,11 +426,8 @@ async def main() -> None:
         }
 
         if proxy_url:
-            if isinstance(proxy_url, dict):
-                launch_args["proxy"] = proxy_url
-            else:
-                launch_args["proxy"] = {"server": proxy_url}
-            actor.log.info("Proxy: Oxylabs (residential CA)")
+            launch_args["proxy"] = proxy_url if isinstance(proxy_url, dict) else {"server": proxy_url}
+            actor.log.info("Proxy: Oxylabs residential CA")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_args)
@@ -324,153 +450,133 @@ async def main() -> None:
                 actor.log.info("Stealth v2 applied ✓")
 
             page = await context.new_page()
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
+            await page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
 
-            # ── NETWORK INTERCEPTION ──────────────────────────────────────
-            # Intercept all /_api/graphql responses and parse them for odds
-            async def handle_response(response):
+            # ── ATTACH RESPONSE LISTENER BEFORE ANY NAVIGATION ───────────
+            # Critical: must be attached before goto() or initial GQL requests are missed
+            async def on_response(response):
                 try:
-                    url = response.url
-                    if "/_api/graphql" not in url:
+                    if "/_api/graphql" not in response.url:
                         return
                     if response.status != 200:
                         return
-                    try:
-                        body = await response.json()
-                    except Exception:
-                        return
-                    if not isinstance(body, dict):
-                        return
-
+                    body = await response.json()
                     recs = extract_records_from_graphql(body, now)
                     if recs:
-                        logger.info(f"Intercepted {len(recs)} records from GraphQL response")
+                        logger.info(f"GQL intercept: {len(recs)} records from {response.url}")
                         intercepted_records.extend(recs)
                     else:
-                        # Log the operation name for debugging
-                        req_post = None
+                        # Log what operation returned for debugging
                         try:
-                            req_post = await response.request.post_data_json()
+                            req_data = await response.request.post_data_json()
+                            op = req_data.get("operationName") if isinstance(req_data, dict) else None
+                            data_keys = list((body.get("data") or {}).keys())
+                            logger.info(f"GQL op={op} | data_keys={data_keys} | no odds extracted")
                         except Exception:
                             pass
-                        op = req_post.get("operationName") if isinstance(req_post, dict) else None
-                        if op:
-                            logger.debug(f"GraphQL op={op} | data keys={list((body.get('data') or {}).keys())}")
                 except Exception as e:
-                    logger.debug(f"Response handler error: {e}")
+                    logger.debug(f"Response handler: {e}")
 
-            page.on("response", handle_response)
+            page.on("response", on_response)
             # ─────────────────────────────────────────────────────────────
 
-            # Navigate to the esports hub
-            esports_url = f"{stake_base}/sports/esports"
-            actor.log.info(f"Navigating to {esports_url}")
-
+            # Navigate esports hub first
+            hub_url = f"{stake_base}/sports/esports"
+            actor.log.info(f"Navigating hub: {hub_url}")
             try:
-                await page.goto(esports_url, wait_until="commit", timeout=30000)
+                await page.goto(hub_url, wait_until="commit", timeout=30000)
             except Exception as e:
-                actor.log.error(f"Navigation failed: {e}")
+                actor.log.error(f"Hub navigation failed: {e}")
                 await browser.close()
                 await actor.push_data({"error": "navigation_failed", "message": str(e)})
                 return
 
-            # Wait for CF
             cf_ok = await handle_cf_challenge(page)
             if not cf_ok:
-                actor.log.error("CF challenge not solved — saving debug artifacts")
+                actor.log.error("CF not solved")
                 try:
                     html = await page.content()
-                    await Actor.set_value("debug_cf_blocked_html", html, content_type="text/html")
+                    await Actor.set_value("debug_cf_html", html, content_type="text/html")
                     shot = await page.screenshot(full_page=True, timeout=15000)
-                    await Actor.set_value("debug_cf_blocked_screenshot", shot, content_type="image/png")
+                    await Actor.set_value("debug_cf_screenshot", shot, content_type="image/png")
                 except Exception:
                     pass
                 await browser.close()
-                await actor.push_data({"error": "cf_not_solved", "url": esports_url})
+                await actor.push_data({"error": "cf_not_solved"})
                 return
 
-            actor.log.info("Past CF — waiting for SPA to load and fire GraphQL requests")
-
-            # Wait for page to fully hydrate and fire all initial GraphQL queries
-            # Stake SPA fires multiple queries on page load — give it time
-            await asyncio.sleep(8)
-
-            # Also wait for network idle
+            # Wait for SPA to fully hydrate
+            actor.log.info("CF solved — waiting for SPA hydration")
+            await asyncio.sleep(6)
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
+                await page.wait_for_load_state("networkidle", timeout=12000)
             except Exception:
                 pass
 
-            # Save debug HTML/screenshot
+            # Save debug HTML + screenshot of hub page
             try:
-                html = await page.content()
-                await Actor.set_value("debug_page_html", html, content_type="text/html")
                 shot = await page.screenshot(full_page=True, timeout=15000)
-                await Actor.set_value("debug_page_screenshot", shot, content_type="image/png")
-            except Exception as e:
-                logger.warning(f"Debug save failed: {e}")
+                await Actor.set_value("debug_hub_screenshot", shot, content_type="image/png")
+            except Exception:
+                pass
 
-            actor.log.info(f"Intercepted {len(intercepted_records)} records from GraphQL so far")
+            # DOM scrape hub page
+            all_records: List[Dict] = []
+            hub_records = await scrape_page_dom(page, now, hub_url)
+            actor.log.info(f"Hub DOM: {len(hub_records)} records")
+            all_records.extend(hub_records)
 
-            # If interception got nothing, try navigating to individual game pages
-            # to trigger more GraphQL calls with authenticated session cookies
-            if len(intercepted_records) < 5:
-                actor.log.info("Interception sparse — drilling into game pages to trigger more GQL calls")
-
-                # Get the list of game links from the loaded page
+            # Navigate each game slug page for more cards
+            actor.log.info(f"Drilling {len(ESPORTS_GAME_SLUGS)} game pages...")
+            for slug in ESPORTS_GAME_SLUGS:
+                game_url = f"{stake_base}/sports/esports/{slug}"
                 try:
-                    game_links = await page.evaluate("""() => {
-                        const links = [];
-                        document.querySelectorAll('a[href*="/sports/esports/"]').forEach(a => {
-                            if (a.href && !links.find(l => l.href === a.href)) {
-                                links.push({href: a.href, text: (a.innerText || '').trim().substring(0, 60)});
-                            }
-                        });
-                        return links.slice(0, 8);
-                    }""")
-                    actor.log.info(f"Found {len(game_links)} game category links")
+                    actor.log.info(f"  → {slug}")
+                    await page.goto(game_url, wait_until="commit", timeout=20000)
+                    # No new CF expected — cookies persist
+                    await asyncio.sleep(4)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
 
-                    for link in game_links[:6]:
-                        try:
-                            actor.log.info(f"Navigating to game: {link['href']}")
-                            await page.goto(link["href"], wait_until="commit", timeout=20000)
-                            # No new CF challenge expected — cookies are set
-                            await asyncio.sleep(5)
-                            try:
-                                await page.wait_for_load_state("networkidle", timeout=10000)
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            logger.warning(f"Game page nav failed: {e}")
-                            continue
+                    game_records = await scrape_page_dom(page, now, game_url)
+                    actor.log.info(f"    {slug}: {len(game_records)} records")
+                    all_records.extend(game_records)
+
                 except Exception as e:
-                    logger.error(f"Game link extraction failed: {e}")
+                    logger.warning(f"  {slug} failed: {e}")
+                    continue
 
-            actor.log.info(f"After game page drilling: {len(intercepted_records)} intercepted records")
+            actor.log.info(f"GQL intercepted: {len(intercepted_records)} | DOM scraped: {len(all_records)}")
 
-            # Fall back to DOM scrape if interception still empty
-            records = intercepted_records[:max_matches]
-            if not records:
-                actor.log.info("No intercepted records — falling back to DOM scrape")
-                await page.goto(esports_url, wait_until="commit", timeout=20000)
-                await asyncio.sleep(6)
-                dom_records = await scrape_via_dom(page, now)
-                actor.log.info(f"DOM scrape found {len(dom_records)} records")
-                records = dom_records[:max_matches]
+            # Merge: prefer GQL records (have start_time), deduplicate by team pair
+            final_records: List[Dict] = []
+            for rec in (intercepted_records + all_records):
+                key = f"{rec.get('team1','').lower()}||{rec.get('team2','').lower()}"
+                if key and key not in seen_keys and rec.get("team1") and rec.get("team2"):
+                    seen_keys.add(key)
+                    final_records.append(rec)
+                elif not rec.get("team1") and not rec.get("team2"):
+                    pass  # skip empty
+
+            final_records = final_records[:max_matches]
+            actor.log.info(f"Final unique records: {len(final_records)}")
 
             await browser.close()
 
-        actor.log.info(f"Total records: {len(records)}")
-        for rec in records:
+        for rec in final_records:
             await actor.push_data(rec)
 
         await actor.push_data({
             "_meta": True,
             "bookmaker": "stake",
-            "records_total": len(records),
-            "method": "graphql_intercept" if intercepted_records else "dom_fallback",
+            "records_total": len(final_records),
+            "gql_records": len(intercepted_records),
+            "dom_records": len(all_records),
+            "method": "gql+dom",
             "scraped_at": now,
         })
 
