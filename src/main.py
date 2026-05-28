@@ -371,7 +371,7 @@ async def main() -> None:
             groups=["RESIDENTIAL"],
             country_code="US",
         )
-        proxy_url_str = proxy_config.new_url() if proxy_config else None
+        proxy_url_str = await proxy_config.new_url() if proxy_config else None
         actor.log.info(f"Apify proxy URL: {proxy_url_str[:40] if proxy_url_str else 'None'}...")
 
         launch_args = {
