@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Apify Actor: Stake.com Esports Odds Scraper v5
+"""Apify Actor: Stake.com Esports Odds Scraper v6
 
-Navigation fix history:
-- v3: wait_until="commit" → blank page (SPA not hydrated), CF check passed on empty title
-- v4: wait_until="domcontentloaded" → 30s timeout (Stake SPA never fires DOMContentLoaded through proxy)
-- v5: back to wait_until="commit" (fast, reliable) + explicit content poll AFTER navigation
-      CF check now requires non-empty title
-      Content wait runs independently after CF resolves
+CF bypass strategy:
+- Use Apify's built-in ProxyConfiguration (RESIDENTIAL group) — rotates IPs automatically
+- Oxylabs sonus_TbxLY kept as fallback via input proxyUrl
+- Headless=True on Apify (xvfb provides virtual display so it's actually rendered)
+- CF Turnstile with residential IP typically auto-solves within 5-15s
 """
 import asyncio
 import json
@@ -28,7 +27,8 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stake-scraper")
 
-DEFAULT_PROXY = {
+# Oxylabs fallback — used only if proxyUrl passed via input
+OXYLABS_PROXY = {
     "server": "http://pr.oxylabs.io:7777",
     "username": "customer-sonus_TbxLY-cc-ca-city-edmonton",
     "password": "gX~dawV=8MzVzA",
@@ -351,19 +351,28 @@ async def navigate_and_wait(page, url: str, label: str) -> bool:
 async def main() -> None:
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
-        proxy_url = input_data.get("proxyUrl") or os.environ.get("OXYLABS_PROXY") or DEFAULT_PROXY
+        proxy_url = input_data.get("proxyUrl") or os.environ.get("OXYLABS_PROXY")
         stake_base = input_data.get("stakeBaseUrl") or STAKE_BASE
         max_matches = input_data.get("maxMatches", 200)
-        headless = input_data.get("headless", False)
+        headless = input_data.get("headless", True)
 
         actor.log.info(
-            f"Stake scraper v5 | headless={headless} "
+            f"Stake scraper v6 | headless={headless} "
             f"stealth={'v2' if STEALTH_AVAILABLE else 'MISSING'}"
         )
 
         now = datetime.now(timezone.utc).isoformat()
         intercepted: List[Dict] = []
         seen_keys: set = set()
+
+        # Use Apify residential proxy group — rotates IPs, much better CF bypass
+        # than a fixed Oxylabs endpoint which CF fingerprints after repeated hits
+        proxy_config = await actor.create_proxy_configuration(
+            groups=["RESIDENTIAL"],
+            country_code="US",
+        )
+        proxy_url_str = proxy_config.new_url() if proxy_config else None
+        actor.log.info(f"Apify proxy URL: {proxy_url_str[:40] if proxy_url_str else 'None'}...")
 
         launch_args = {
             "headless": headless,
@@ -374,9 +383,16 @@ async def main() -> None:
                 "--window-size=1920,1080", "--disable-automation",
             ]
         }
-        if proxy_url:
+
+        # Proxy priority: Apify residential > input override > no proxy
+        if proxy_url_str:
+            launch_args["proxy"] = {"server": proxy_url_str}
+            actor.log.info("Proxy: Apify RESIDENTIAL")
+        elif proxy_url:
             launch_args["proxy"] = proxy_url if isinstance(proxy_url, dict) else {"server": proxy_url}
-            actor.log.info("Proxy: Oxylabs residential CA")
+            actor.log.info("Proxy: input override")
+        else:
+            actor.log.info("Proxy: none (direct)")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_args)
