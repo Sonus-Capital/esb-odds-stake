@@ -369,7 +369,7 @@ async def main() -> None:
         # than a fixed Oxylabs endpoint which CF fingerprints after repeated hits
         proxy_config = await actor.create_proxy_configuration(
             groups=["RESIDENTIAL"],
-            country_code="US",
+            country_code="CA",
         )
         proxy_url_str = await proxy_config.new_url() if proxy_config else None
         actor.log.info(f"Apify proxy URL: {proxy_url_str[:40] if proxy_url_str else 'None'}...")
