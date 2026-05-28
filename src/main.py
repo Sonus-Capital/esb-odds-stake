@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Apify Actor: Stake.com Esports Odds Scraper v6
+"""Apify Actor: Stake.com Esports Odds Scraper v7
 
-CF bypass strategy:
-- Use Apify's built-in ProxyConfiguration (RESIDENTIAL group) — rotates IPs automatically
-- Oxylabs sonus_TbxLY kept as fallback via input proxyUrl
-- Headless=True on Apify (xvfb provides virtual display so it's actually rendered)
-- CF Turnstile with residential IP typically auto-solves within 5-15s
+Proxy: Oxylabs sonus_TbxLY CA Edmonton — confirmed working, page loads in 1s.
+Do NOT change the proxy. Do NOT use US. Stake geo-blocks US.
 """
 import asyncio
-import json
 import logging
 import os
 import re
@@ -27,11 +23,10 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stake-scraper")
 
-# Oxylabs fallback — used only if proxyUrl passed via input
-OXYLABS_PROXY = {
+DEFAULT_PROXY = {
     "server": "http://pr.oxylabs.io:7777",
     "username": "customer-sonus_TbxLY-cc-ca-city-edmonton",
-    "password": "gX~dawV=8MzVzA",
+    "password": "***",
 }
 
 STAKE_BASE = "https://stake.com"
@@ -62,11 +57,7 @@ def parse_decimal_odds(val) -> Optional[float]:
 
 
 async def wait_for_spa(page, timeout_s: int = 25) -> bool:
-    """
-    Poll until body has real content (SPA hydrated).
-    Returns True when body.innerText > 500 chars with a real title.
-    Compatible with wait_until='commit' navigation.
-    """
+    """Poll until body has real content (> 500 chars and non-empty title)."""
     for i in range(timeout_s):
         await asyncio.sleep(1)
         try:
@@ -83,7 +74,7 @@ async def wait_for_spa(page, timeout_s: int = 25) -> bool:
 
 
 async def handle_cf_challenge(page, max_wait_s: int = 90) -> bool:
-    """Wait for CF to resolve. Requires non-empty title — empty title = blank page, not CF pass."""
+    """Wait for CF. Non-empty title required — empty = page not loaded."""
     for i in range(max_wait_s):
         await asyncio.sleep(1)
         try:
@@ -93,14 +84,13 @@ async def handle_cf_challenge(page, max_wait_s: int = 90) -> bool:
             continue
         if i % 10 == 0 or i < 3:
             logger.info(f"CF wait {i+1}s | title={title!r}")
-        # Must have a real title — empty string means page hasn't loaded yet
         if (
-            title                                          # non-empty
+            title
             and title != "Just a moment..."
             and "__cf_chl" not in cur_url
             and "challenge" not in cur_url.lower()
         ):
-            logger.info(f"CF resolved at {i+1}s | title={title!r}")
+            logger.info(f"CF resolved at {i+1}s")
             return True
     return False
 
@@ -167,17 +157,8 @@ def extract_records_from_graphql(body: dict, now: str) -> List[Dict]:
 
 def parse_card_lines(lines: list) -> Optional[Dict]:
     """
-    Parse Stake card text lines into structured odds record.
-    Observed structure:
-      line0: game name
-      line1: status (Live / countdown / date)
-      [optional] map: "5th Map"
-      tournament name
-      team1
-      team2
-      [score digits if live]
-      "Match Winner - Twoway/Threeway"
-      decimal odds (2 or 3 values)
+    Parse Stake card text lines.
+    Structure: game / status / [map] / tournament / team1 / team2 / [scores] / Match Winner / odds
     """
     odds_values = []
     for line in lines:
@@ -217,7 +198,6 @@ def parse_card_lines(lines: list) -> Optional[Dict]:
         elif len(candidates) == 1:
             team2 = candidates[0][1]
     else:
-        # Heuristic: find first odds line, take two non-numeric lines before it
         first_odds = next(
             (i for i, l in enumerate(lines) if re.match(r"^\d{1,3}\.\d{2,3}$", l.strip())),
             None
@@ -251,7 +231,7 @@ def parse_card_lines(lines: list) -> Optional[Dict]:
 
 
 async def scrape_page_dom(page, now: str, page_url: str) -> List[Dict]:
-    """Odds-density DOM scrape. No class-name assumptions."""
+    """Odds-density DOM scrape — no class-name assumptions."""
     records = []
     try:
         cards_data = await page.evaluate("""() => {
@@ -277,7 +257,6 @@ async def scrape_page_dom(page, now: str, page_url: str) -> List[Dict]:
                 if (nonNum.length < 2) continue;
                 const key = text.substring(0, 80);
                 if (seen.has(key)) continue;
-                // Prefer smallest container — skip if a subset is already captured
                 let skip = false;
                 for (const r of results) {
                     if (r.text.length < text.length && text.includes(r.text.substring(0, 60))) {
@@ -287,11 +266,7 @@ async def scrape_page_dom(page, now: str, page_url: str) -> List[Dict]:
                 if (skip) continue;
                 seen.add(key);
                 const a = el.tagName === 'A' ? el : el.querySelector('a[href*="/sports/"]');
-                results.push({
-                    text: text.substring(0, 700),
-                    href: a ? a.href : '',
-                    odds
-                });
+                results.push({ text: text.substring(0, 700), href: a ? a.href : '', odds });
             }
             return results.slice(0, 150);
         }""")
@@ -321,58 +296,22 @@ async def scrape_page_dom(page, now: str, page_url: str) -> List[Dict]:
     return records
 
 
-async def navigate_and_wait(page, url: str, label: str) -> bool:
-    """
-    Navigate with wait_until='commit' (fast, works through proxy),
-    then poll until SPA content appears.
-    Returns True if content loaded.
-    """
-    try:
-        await page.goto(url, wait_until="commit", timeout=45000)
-    except PWTimeout:
-        logger.warning(f"{label}: commit timeout")
-        return False
-    except Exception as e:
-        logger.warning(f"{label}: nav error: {e}")
-        return False
-
-    ok = await wait_for_spa(page, timeout_s=20)
-    if not ok:
-        logger.warning(f"{label}: SPA never hydrated — saving debug HTML")
-        try:
-            html = await page.content()
-            key = re.sub(r"[^a-z0-9]", "_", label.lower())[:40]
-            await Actor.set_value(f"debug_blank_{key}", html, content_type="text/html")
-        except Exception:
-            pass
-    return ok
-
-
 async def main() -> None:
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
-        proxy_url = input_data.get("proxyUrl") or os.environ.get("OXYLABS_PROXY")
+        proxy_url = input_data.get("proxyUrl") or DEFAULT_PROXY
         stake_base = input_data.get("stakeBaseUrl") or STAKE_BASE
         max_matches = input_data.get("maxMatches", 200)
         headless = input_data.get("headless", True)
 
         actor.log.info(
-            f"Stake scraper v6 | headless={headless} "
+            f"Stake scraper v7 | headless={headless} "
             f"stealth={'v2' if STEALTH_AVAILABLE else 'MISSING'}"
         )
 
         now = datetime.now(timezone.utc).isoformat()
         intercepted: List[Dict] = []
         seen_keys: set = set()
-
-        # Use Apify residential proxy group — rotates IPs, much better CF bypass
-        # than a fixed Oxylabs endpoint which CF fingerprints after repeated hits
-        proxy_config = await actor.create_proxy_configuration(
-            groups=["RESIDENTIAL"],
-            country_code="CA",
-        )
-        proxy_url_str = await proxy_config.new_url() if proxy_config else None
-        actor.log.info(f"Apify proxy URL: {proxy_url_str[:40] if proxy_url_str else 'None'}...")
 
         launch_args = {
             "headless": headless,
@@ -381,18 +320,14 @@ async def main() -> None:
                 "--no-sandbox", "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage", "--disable-gpu",
                 "--window-size=1920,1080", "--disable-automation",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
             ]
         }
 
-        # Proxy priority: Apify residential > input override > no proxy
-        if proxy_url_str:
-            launch_args["proxy"] = {"server": proxy_url_str}
-            actor.log.info("Proxy: Apify RESIDENTIAL")
-        elif proxy_url:
+        if proxy_url:
             launch_args["proxy"] = proxy_url if isinstance(proxy_url, dict) else {"server": proxy_url}
-            actor.log.info("Proxy: input override")
-        else:
-            actor.log.info("Proxy: none (direct)")
+            actor.log.info("Proxy: Oxylabs CA Edmonton")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_args)
@@ -410,15 +345,27 @@ async def main() -> None:
             )
 
             if STEALTH_AVAILABLE:
-                await Stealth().apply_stealth_async(context)
+                stealth = Stealth(
+                    navigator_webdriver=True,
+                    chrome_runtime=True,
+                    navigator_plugins=True,
+                    navigator_languages=True,
+                    navigator_platform=True,
+                    webgl_vendor=True,
+                    hairline=True,
+                    media_codecs=True,
+                )
+                await stealth.apply_stealth_async(context)
                 actor.log.info("Stealth v2 applied ✓")
 
             page = await context.new_page()
-            await page.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-CA', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            """)
 
-            # GQL listener attached before any navigation
+            # GQL listener — attached before any navigation
             async def on_response(response):
                 try:
                     if "/_api/graphql" not in response.url or response.status != 200:
@@ -426,7 +373,7 @@ async def main() -> None:
                     body = await response.json()
                     recs = extract_records_from_graphql(body, now)
                     if recs:
-                        logger.info(f"GQL: {len(recs)} records intercepted")
+                        logger.info(f"GQL: {len(recs)} records")
                         intercepted.extend(recs)
                     else:
                         try:
@@ -441,7 +388,7 @@ async def main() -> None:
 
             page.on("response", on_response)
 
-            # ── Hub ──────────────────────────────────────────────────────
+            # Hub navigation
             hub_url = f"{stake_base}/sports/esports"
             actor.log.info(f"Hub: {hub_url}")
 
@@ -453,7 +400,6 @@ async def main() -> None:
                 await actor.push_data({"error": "nav_failed", "message": str(e)})
                 return
 
-            # CF check — waits for real non-empty title
             cf_ok = await handle_cf_challenge(page)
             if not cf_ok:
                 actor.log.error("CF not solved")
@@ -468,11 +414,8 @@ async def main() -> None:
                 await actor.push_data({"error": "cf_not_solved"})
                 return
 
-            # Now wait for SPA content (separate from CF check)
             spa_ok = await wait_for_spa(page, timeout_s=20)
             actor.log.info(f"SPA hydrated: {spa_ok}")
-
-            # Extra settle for React render
             await asyncio.sleep(3)
 
             # Debug snapshot
@@ -490,16 +433,19 @@ async def main() -> None:
             actor.log.info(f"Hub: {len(hub_recs)} records")
             all_dom.extend(hub_recs)
 
-            # ── Game pages ───────────────────────────────────────────────
+            # Game pages
             for slug in ESPORTS_GAME_SLUGS:
                 game_url = f"{stake_base}/sports/esports/{slug}"
                 actor.log.info(f"→ {slug}")
-                ok = await navigate_and_wait(page, game_url, slug)
-                if ok:
+                try:
+                    await page.goto(game_url, wait_until="commit", timeout=30000)
+                    await wait_for_spa(page, timeout_s=12)
                     await asyncio.sleep(2)
                     recs = await scrape_page_dom(page, now, game_url)
                     actor.log.info(f"  {slug}: {len(recs)} records")
                     all_dom.extend(recs)
+                except Exception as e:
+                    logger.warning(f"  {slug} failed: {e}")
 
             actor.log.info(f"GQL={len(intercepted)} DOM={len(all_dom)}")
 
