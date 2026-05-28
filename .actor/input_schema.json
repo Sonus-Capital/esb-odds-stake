@@ -3,11 +3,24 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
+    "proxyUrl": {
+      "title": "Oxylabs proxy URL",
+      "type": "string",
+      "description": "Full Oxylabs residential proxy URL, e.g. http://customer-USER-cc-MX:PASS@pr.oxylabs.io:7777. Overrides proxyConfiguration if set.",
+      "editor": "textfield"
+    },
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Proxy settings",
+      "description": "Apify proxy settings (fallback if proxyUrl not set)",
       "editor": "proxy"
+    },
+    "stakeBaseUrl": {
+      "title": "Stake base URL",
+      "type": "string",
+      "description": "Stake homepage URL (will be used to derive sport pages). Default: https://stake.com",
+      "default": "https://stake.com",
+      "editor": "textfield"
     },
     "maxMatches": {
       "title": "Max matches",
