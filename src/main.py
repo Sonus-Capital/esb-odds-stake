@@ -30,8 +30,8 @@ logger = logging.getLogger("stake-scraper")
 
 DEFAULT_PROXY = {
     "server": "http://pr.oxylabs.io:7777",
-    "username": "customer-sonus_TbxLY-cc-ca-city-edmonton",
-    "password": "***",
+    "username": "numbnuts_9kOSG",
+    "password": "~SWmnT7Qe~n7Fi",
 }
 
 STAKE_BASE = "https://stake.com"
