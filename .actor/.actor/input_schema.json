@@ -1,1 +1,1 @@
-{"title": "Stake Scraper Input", "type": "object", "properties": { "maxMatches": { "type": "number" }, "proxyConfiguration": { "type": "object" } }}
+{"title": "Stake Scraper Input", "type": "object", "properties": { "maxMatches": { "type": "number" }, "proxyConfiguration": { "type": "object" } }, "schemaVersion": 1}
