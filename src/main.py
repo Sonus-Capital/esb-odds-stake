@@ -27,12 +27,14 @@ async def scrape_page(page, url: str, sport_name: str) -> List[Dict]:
     records = []
     logger.info(f"Scraping: {url}")
     try:
-        await page.goto(url, wait_until="networkidle", timeout=60000)
+        # domcontentloaded is enough — networkidle never fires on Stake's SPA
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         logger.error(f"Navigation failed for {url}: {e}")
         return records
 
-    await asyncio.sleep(6)
+    # Wait for JS to hydrate the SPA
+    await asyncio.sleep(8)
 
     html = await page.content()
     logger.info(f"Page HTML length: {len(html)}")
@@ -94,10 +96,26 @@ async def amain():
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
         max_matches = input_data.get("maxMatches", 500)
+        proxy_config = input_data.get("proxyConfiguration")
+
+        proxy_url = None
+        if proxy_config:
+            try:
+                proxy = await actor.create_proxy_configuration(proxy_config)
+                proxy_url = await proxy.new_url()
+                logger.info(f"Using proxy: {proxy_url[:30]}...")
+            except Exception as e:
+                logger.warning(f"Proxy setup failed: {e}")
+
+        # Fallback to Oxylabs if no Apify proxy configured
+        if not proxy_url:
+            proxy_url = "http://customer-sonus_TbxLY-cc-ca-city-edmonton:gX~dawV=8MzVzA@pr.oxylabs.io:7777"
+            logger.info("Using Oxylabs proxy")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
+                proxy={"server": proxy_url},
                 args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
             )
             context = await browser.new_context(
@@ -109,7 +127,7 @@ async def amain():
             all_records = []
 
             for sport in STAKE_ESPORTS:
-                url = f"https://stake.com/sports/esports/{sport['slug']}" if sport["slug"] != "esports" else "https://stake.com/sports/esports"
+                url = "https://stake.com/sports/esports" if sport["slug"] == "esports" else f"https://stake.com/sports/esports/{sport['slug']}"
                 try:
                     records = await scrape_page(page, url, sport["name"])
                     all_records.extend(records)
