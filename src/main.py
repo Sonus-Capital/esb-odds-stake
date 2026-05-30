@@ -1,9 +1,14 @@
+#!/usr/bin/env python3
+"""Apify Actor: Stake.com Esports Odds Scraper v4
+Single-page scrape of /sports/esports with load-more clicks + robust DOM extraction.
+"""
+
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 
-from apify import Actor, ProxyConfiguration
+from apify import Actor
 from playwright.async_api import async_playwright
 
 try:
@@ -19,6 +24,19 @@ BASE_URL = "https://stake.com/sports/esports"
 OXYLABS_USER = "customer-sonus_TbxLY-cc-ca-city-edmonton"
 OXYLABS_PASS = "gX~dawV=8MzVzA"
 OXYLABS_HOST = "pr.oxylabs.io:7777"
+
+
+async def wait_for_cf(page, timeout: int = 15) -> bool:
+    """Wait for Cloudflare challenge to resolve."""
+    for i in range(timeout):
+        title = await page.title()
+        logger.info(f"CF wait {i+1}s | title='{title}'")
+        if "Just a moment" not in title and "Cloudflare" not in title:
+            logger.info(f"CF resolved at {i+1}s")
+            return True
+        await asyncio.sleep(1)
+    logger.warning("CF did not resolve within timeout")
+    return False
 
 
 async def click_load_more(page, max_clicks: int = 20) -> int:
@@ -85,38 +103,43 @@ async def extract_markets(page) -> List[Dict]:
     }""")
 
 
-async def amain():
+async def amain() -> None:
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
-        max_clicks = input_data.get("maxLoadMoreClicks", 20)
-        max_matches = input_data.get("maxMatches", 500)
         proxy_config = input_data.get("proxyConfiguration")
+        max_matches = input_data.get("maxMatches", 500)
+        max_clicks = input_data.get("maxLoadMoreClicks", 20)
+        headless = input_data.get("headless", True)
 
-        # Use Apify proxyConfiguration if provided, otherwise fall back to Oxylabs via proxy_urls
+        actor.log.info(f"Stake scraper v4 | base={BASE_URL} headless={headless}")
+
+        launch_args = {
+            "headless": headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ]
+        }
+
+        # Proxy: use Apify proxyConfiguration if provided, else hardcoded Oxylabs
         if proxy_config:
-            proxy = await actor.create_proxy_configuration(proxy_config)
-            logger.info("Using Apify proxyConfiguration")
+            try:
+                proxy = await actor.create_proxy_configuration(proxy_config)
+                proxy_url = await proxy.new_url()
+                launch_args["proxy"] = {"server": proxy_url}
+                actor.log.info(f"Proxy: Apify proxyConfiguration ({proxy_url[:40]}...)")
+            except Exception as e:
+                actor.log.warning(f"Proxy setup failed: {e}")
         else:
-            proxy = await actor.create_proxy_configuration(
-                proxy_urls=[f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"]
-            )
-            logger.info("Using Oxylabs residential CA proxy via ProxyConfiguration")
-
-        proxy_url = await proxy.new_url()
-        logger.info(f"Proxy URL resolved: {proxy_url[:40]}...")
+            proxy_url = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
+            launch_args["proxy"] = {"server": proxy_url}
+            actor.log.info("Proxy: Oxylabs residential CA")
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                proxy={"server": proxy_url},
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
+            browser = await p.chromium.launch(**launch_args)
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080},
@@ -128,43 +151,50 @@ async def amain():
 
             if stealth_async:
                 await stealth_async(page)
-                logger.info("Stealth applied")
+                actor.log.info("Stealth v2 applied ✓")
 
-            # Warm up on homepage first
+            # Warm up on homepage
             try:
-                logger.info("Warming up on stake.com homepage...")
+                actor.log.info("Warming up with stake.com homepage")
                 await page.goto("https://stake.com", wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.warning(f"Warm-up failed: {e}")
+                actor.log.warning(f"Warm-up failed: {e}")
 
-            logger.info(f"Navigating to {BASE_URL}")
+            # Navigate to esports hub
+            actor.log.info(f"Navigating hub: {BASE_URL}")
             try:
                 await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
             except Exception as e:
-                logger.error(f"Navigation failed: {e}")
+                actor.log.error(f"Navigation failed: {e}")
                 await browser.close()
                 return
 
+            # Wait for CF challenge
+            await wait_for_cf(page)
+            actor.log.info("CF solved — waiting for SPA hydration")
             await asyncio.sleep(8)
 
+            # Debug snapshot
             html = await page.content()
-            logger.info(f"Initial HTML length: {len(html)}")
+            actor.log.info(f"Initial HTML length: {len(html)}")
             await Actor.set_value("debug_html_initial", html, content_type="text/html")
             screenshot = await page.screenshot(full_page=True)
             await Actor.set_value("debug_screenshot_initial", screenshot, content_type="image/png")
 
+            # Click load more
             clicks = await click_load_more(page, max_clicks)
-            logger.info(f"Load More clicked {clicks} times")
+            actor.log.info(f"Load More clicked {clicks} times")
 
+            # Final snapshot
             html_final = await page.content()
-            logger.info(f"Final HTML length: {len(html_final)}")
+            actor.log.info(f"Final HTML length: {len(html_final)}")
             await Actor.set_value("debug_html_final", html_final, content_type="text/html")
             screenshot_final = await page.screenshot(full_page=True)
             await Actor.set_value("debug_screenshot_final", screenshot_final, content_type="image/png")
 
             raw_markets = await extract_markets(page)
-            logger.info(f"Extracted {len(raw_markets)} raw market blocks")
+            actor.log.info(f"DOM: found {len(raw_markets)} market blocks")
 
             await browser.close()
 
@@ -184,7 +214,7 @@ async def amain():
                 "scraped_at": datetime.now(timezone.utc).isoformat(),
             })
 
-        logger.info(f"Total records: {len(all_records)}")
+        actor.log.info(f"Final unique records: {len(all_records)}")
         for rec in all_records[:max_matches]:
             await actor.push_data(rec)
 
