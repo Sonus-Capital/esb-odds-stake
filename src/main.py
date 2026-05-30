@@ -2,9 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import List, Dict
-from urllib.parse import quote
 
-from apify import Actor
+from apify import Actor, ProxyConfiguration
 from playwright.async_api import async_playwright
 
 try:
@@ -17,14 +16,9 @@ logger = logging.getLogger("stake-scraper")
 
 BASE_URL = "https://stake.com/sports/esports"
 
-# Oxylabs dedicated residential — CA Edmonton (Stake bypass)
 OXYLABS_USER = "customer-sonus_TbxLY-cc-ca-city-edmonton"
 OXYLABS_PASS = "gX~dawV=8MzVzA"
 OXYLABS_HOST = "pr.oxylabs.io:7777"
-
-
-def build_proxy_url(user: str, password: str, host: str) -> str:
-    return f"http://{quote(user, safe='')}:{quote(password, safe='')}@{host}"
 
 
 async def click_load_more(page, max_clicks: int = 20) -> int:
@@ -98,19 +92,18 @@ async def amain():
         max_matches = input_data.get("maxMatches", 500)
         proxy_config = input_data.get("proxyConfiguration")
 
-        # Resolve proxy URL — prefer Apify proxyConfiguration, fall back to Oxylabs
-        proxy_url = None
+        # Use Apify proxyConfiguration if provided, otherwise fall back to Oxylabs via proxy_urls
         if proxy_config:
-            try:
-                proxy = await actor.create_proxy_configuration(proxy_config)
-                proxy_url = await proxy.new_url()
-                logger.info(f"Using Apify proxy: {proxy_url[:40]}...")
-            except Exception as e:
-                logger.warning(f"Apify proxy setup failed: {e}")
+            proxy = await actor.create_proxy_configuration(proxy_config)
+            logger.info("Using Apify proxyConfiguration")
+        else:
+            proxy = await actor.create_proxy_configuration(
+                proxy_urls=[f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"]
+            )
+            logger.info("Using Oxylabs residential CA proxy via ProxyConfiguration")
 
-        if not proxy_url:
-            proxy_url = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
-            logger.info("Using Oxylabs residential CA proxy")
+        proxy_url = await proxy.new_url()
+        logger.info(f"Proxy URL resolved: {proxy_url[:40]}...")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -145,7 +138,6 @@ async def amain():
             except Exception as e:
                 logger.warning(f"Warm-up failed: {e}")
 
-            # Navigate to esports hub
             logger.info(f"Navigating to {BASE_URL}")
             try:
                 await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
@@ -162,7 +154,6 @@ async def amain():
             screenshot = await page.screenshot(full_page=True)
             await Actor.set_value("debug_screenshot_initial", screenshot, content_type="image/png")
 
-            # Click load more until exhausted
             clicks = await click_load_more(page, max_clicks)
             logger.info(f"Load More clicked {clicks} times")
 
