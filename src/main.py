@@ -109,7 +109,7 @@ async def amain():
                 logger.warning(f"Apify proxy setup failed: {e}")
 
         if not proxy_url:
-            proxy_url = build_proxy_url(OXYLABS_USER, OXYLABS_PASS, OXYLABS_HOST)
+            proxy_url = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
             logger.info("Using Oxylabs residential CA proxy")
 
         async with async_playwright() as p:
