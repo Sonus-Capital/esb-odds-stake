@@ -130,7 +130,7 @@ async def amain() -> None:
             actor.log.info("Proxy: defaulting to Apify residential proxy")
 
         try:
-            proxy = await actor.create_proxy_configuration(proxy_config)
+            proxy = await actor.create_proxy_configuration(actor_proxy_input=proxy_config)
             proxy_url = await proxy.new_url()
             launch_args["proxy"] = {"server": proxy_url}
             actor.log.info(f"Proxy resolved: {proxy_url[:50]}...")
