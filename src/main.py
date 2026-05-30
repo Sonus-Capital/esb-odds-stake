@@ -124,21 +124,30 @@ async def amain() -> None:
             ]
         }
 
-        # Proxy: use proxyConfiguration from input, default to Apify residential, fallback to Oxylabs
-        if not proxy_config:
-            proxy_config = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
-            actor.log.info("Proxy: defaulting to Apify residential proxy")
+        # Proxy setup — try in order: input proxyConfig, Apify residential, no proxy
+        proxy_url = None
+        if proxy_config:
+            try:
+                proxy = await actor.create_proxy_configuration(actor_proxy_input=proxy_config)
+                proxy_url = await proxy.new_url()
+                actor.log.info(f"Proxy: input config resolved: {proxy_url[:50]}...")
+            except Exception as e:
+                actor.log.warning(f"Input proxy failed: {e}")
 
-        try:
-            proxy = await actor.create_proxy_configuration(actor_proxy_input=proxy_config)
-            proxy_url = await proxy.new_url()
+        if not proxy_url:
+            try:
+                proxy = await actor.create_proxy_configuration(
+                    actor_proxy_input={"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
+                )
+                proxy_url = await proxy.new_url()
+                actor.log.info(f"Proxy: Apify residential resolved: {proxy_url[:50]}...")
+            except Exception as e:
+                actor.log.warning(f"Apify residential failed: {e}")
+
+        if proxy_url:
             launch_args["proxy"] = {"server": proxy_url}
-            actor.log.info(f"Proxy resolved: {proxy_url[:50]}...")
-        except Exception as e:
-            actor.log.warning(f"Apify proxy failed ({e}), falling back to Oxylabs")
-            proxy_url = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
-            launch_args["proxy"] = {"server": proxy_url}
-            actor.log.info("Proxy: Oxylabs residential CA (fallback)")
+        else:
+            actor.log.info("Proxy: none — running direct (no proxy)")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_args)
