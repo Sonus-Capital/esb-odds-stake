@@ -90,7 +90,7 @@ async def scrape_page(page, url: str, sport_name: str) -> List[Dict]:
     return records
 
 
-async def main():
+async def amain():
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
         max_matches = input_data.get("maxMatches", 500)
@@ -126,5 +126,5 @@ async def main():
         await Actor.set_value("summary", {"total": len(all_records), "scraped_at": datetime.now(timezone.utc).isoformat()})
 
 
-# Apify entrypoint — Actor.main handles the event loop
-Actor.main(main)
+def main():
+    asyncio.run(amain())
