@@ -1,1 +1,26 @@
-{"properties": { "maxMatches": { "type": "number" }, "proxyConfiguration": { "type": "object" } }, "type": "object"}
+{
+  "title": "Stake Esports Odds Scraper",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "proxyConfiguration": {
+      "title": "Proxy configuration",
+      "type": "object",
+      "description": "Proxy settings. Defaults to Apify residential proxy.",
+      "prefill": { "useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"] },
+      "editor": "proxy"
+    },
+    "maxMatches": {
+      "title": "Max matches",
+      "type": "integer",
+      "description": "Maximum number of match records to return.",
+      "default": 500
+    },
+    "maxLoadMoreClicks": {
+      "title": "Max load more clicks",
+      "type": "integer",
+      "description": "How many times to click Load More on the esports hub page.",
+      "default": 20
+    }
+  }
+}

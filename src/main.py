@@ -124,19 +124,21 @@ async def amain() -> None:
             ]
         }
 
-        # Proxy: use Apify proxyConfiguration if provided, else hardcoded Oxylabs
-        if proxy_config:
-            try:
-                proxy = await actor.create_proxy_configuration(proxy_config)
-                proxy_url = await proxy.new_url()
-                launch_args["proxy"] = {"server": proxy_url}
-                actor.log.info(f"Proxy: Apify proxyConfiguration ({proxy_url[:40]}...)")
-            except Exception as e:
-                actor.log.warning(f"Proxy setup failed: {e}")
-        else:
+        # Proxy: use proxyConfiguration from input, default to Apify residential, fallback to Oxylabs
+        if not proxy_config:
+            proxy_config = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
+            actor.log.info("Proxy: defaulting to Apify residential proxy")
+
+        try:
+            proxy = await actor.create_proxy_configuration(proxy_config)
+            proxy_url = await proxy.new_url()
+            launch_args["proxy"] = {"server": proxy_url}
+            actor.log.info(f"Proxy resolved: {proxy_url[:50]}...")
+        except Exception as e:
+            actor.log.warning(f"Apify proxy failed ({e}), falling back to Oxylabs")
             proxy_url = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
             launch_args["proxy"] = {"server": proxy_url}
-            actor.log.info("Proxy: Oxylabs residential CA")
+            actor.log.info("Proxy: Oxylabs residential CA (fallback)")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch_args)
