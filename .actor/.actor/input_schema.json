@@ -1,0 +1,1 @@
+{"properties": { "maxMatches": { "type": "number" }, "proxyConfiguration": { "type": "object" } }, "type": "object"}
