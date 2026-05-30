@@ -23,7 +23,7 @@ logger = logging.getLogger("stake-scraper")
 
 BASE_URL = "https://stake.com/sports/esports"
 
-OXYLABS_USER = "customer-sonus_TbxLY-cc-ca-city-edmonton"
+OXYLABS_USER = "customer-sonus_TbxLY-cc-ie-city-dublin"
 OXYLABS_PASS = "gX~dawV=8MzVzA"
 OXYLABS_HOST = "pr.oxylabs.io:7777"
 PROXY_URL = f"http://{OXYLABS_USER}:{OXYLABS_PASS}@{OXYLABS_HOST}"
@@ -114,11 +114,16 @@ async def amain():
 
         actor.log.info(f"Stake scraper v4 | base={BASE_URL} headless={headless}")
 
-        actor.log.info("Proxy: none — running direct")
+        proxy_urls = [PROXY_URL] * 10
+        proxy_configuration = ProxyConfiguration(proxy_urls=proxy_urls)
+        proxy_url = await proxy_configuration.new_url()
+        actor.log.info(f"Proxy: Oxylabs residential IE Dublin")
+        actor.log.info(f"Proxy URL: {proxy_url[:50]}...")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=headless,
+                proxy={"server": proxy_url},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
