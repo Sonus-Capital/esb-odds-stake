@@ -114,17 +114,11 @@ async def amain():
 
         actor.log.info(f"Stake scraper v4 | base={BASE_URL} headless={headless}")
 
-        # Use crawlee ProxyConfiguration with direct proxy URLs — same pattern as working JS actors
-        proxy_urls = [PROXY_URL] * 10
-        proxy_configuration = ProxyConfiguration(proxy_urls=proxy_urls)
-        proxy_url = await proxy_configuration.new_url()
-        actor.log.info(f"Proxy: Oxylabs residential CA via crawlee ProxyConfiguration")
-        actor.log.info(f"Proxy URL: {proxy_url[:50]}...")
+        actor.log.info("Proxy: none — running direct")
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=headless,
-                proxy={"server": proxy_url},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
