@@ -1,9 +1,9 @@
 import asyncio
-import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
+
 from apify import Actor
 from playwright.async_api import async_playwright
 
@@ -15,56 +15,131 @@ STAKE_ESPORTS = [
     {"slug": "dota-2", "name": "Dota 2"},
     {"slug": "counter-strike", "name": "CS2"},
     {"slug": "league-of-legends", "name": "League of Legends"},
+    {"slug": "valorant", "name": "Valorant"},
+    {"slug": "mobile-legends", "name": "Mobile Legends"},
+    {"slug": "king-of-glory", "name": "King of Glory"},
+    {"slug": "rocket-league", "name": "Rocket League"},
+    {"slug": "overwatch", "name": "Overwatch"},
+    {"slug": "fifa", "name": "FIFA"},
 ]
 
-async def scrape_stake_page(page, url: str, sport_name: str, max_matches: int) -> List[Dict]:
-    records: List[Dict] = []
-    logger.info(f"--- STARTING SCRAPE: {url} ({sport_name}) ---")
+
+async def scrape_page(page, url: str, sport_name: str) -> List[Dict]:
+    records = []
+    logger.info(f"Scraping: {url}")
     try:
-        resp = await page.goto(url, wait_until="networkidle", timeout=60000)
-        logger.info(f"Page loaded with status {resp.status}")
+        await page.goto(url, wait_until="networkidle", timeout=60000)
     except Exception as e:
-        logger.error(f"Navigation failed: {e}")
+        logger.error(f"Navigation failed for {url}: {e}")
         return records
-    await asyncio.sleep(5)
-    try:
-        html = await page.content()
-        logger.info(f"HTML content length: {len(html)}")
-        extracted = await page.evaluate("""() => {
-            const results = [];
-            const allEls = document.querySelectorAll("*");
-            for (const el of allEls) {
-                if (el.innerText && el.innerText.includes("vs") && el.children.length === 0) {
-                    results.push(el.innerText);
+
+    await asyncio.sleep(6)
+
+    html = await page.content()
+    logger.info(f"Page HTML length: {len(html)}")
+
+    # Save debug snapshot
+    await Actor.set_value(f"debug_html_{sport_name}", html, content_type="text/html")
+    screenshot = await page.screenshot(full_page=True)
+    await Actor.set_value(f"debug_screenshot_{sport_name}", screenshot, content_type="image/png")
+
+    # Extract via JS — look for odds-like numbers near team name text
+    extracted = await page.evaluate("""() => {
+        const results = [];
+        // Find all leaf text nodes containing decimal odds
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        const oddsPattern = /^\\d+\\.\\d{2,3}$/;
+        let node;
+        while (node = walker.nextNode()) {
+            const text = node.textContent.trim();
+            if (oddsPattern.test(text)) {
+                // Walk up to find a container with team info
+                let el = node.parentElement;
+                for (let i = 0; i < 8; i++) {
+                    if (!el) break;
+                    const inner = el.innerText || '';
+                    const lines = inner.split('\\n').map(l => l.trim()).filter(l => l.length > 1);
+                    // Look for containers with 2+ non-odds text lines (team names)
+                    const teamLines = lines.filter(l => !oddsPattern.test(l) && l.length > 2 && l.length < 50);
+                    const oddsLines = lines.filter(l => oddsPattern.test(l));
+                    if (teamLines.length >= 2 && oddsLines.length >= 2) {
+                        results.push({
+                            teams: teamLines.slice(0, 4),
+                            odds: oddsLines.slice(0, 3),
+                            raw: inner.substring(0, 200)
+                        });
+                        break;
+                    }
+                    el = el.parentElement;
                 }
             }
-            return results;
-        }""")
-        logger.info(f"Extracted {len(extracted)} potential match strings")
-        for s in extracted:
-            records.append({"bookmaker": "stake", "game_raw": sport_name, "team_info": s, "odds": "TBD", "scraped_at": datetime.now(timezone.utc).isoformat()})
-    except Exception as e:
-        logger.error(f"Extraction failed: {e}")
-    return records[:max_matches]
+        }
+        // Deduplicate by raw text
+        const seen = new Set();
+        return results.filter(r => {
+            if (seen.has(r.raw)) return false;
+            seen.add(r.raw);
+            return true;
+        });
+    }""")
 
-async def main() -> None:
+    logger.info(f"{sport_name}: extracted {len(extracted)} raw market blocks")
+
+    for item in extracted:
+        teams = item.get("teams", [])
+        odds = item.get("odds", [])
+        if len(teams) < 2:
+            continue
+        records.append({
+            "bookmaker": "stake",
+            "game": sport_name,
+            "team1": teams[0],
+            "team2": teams[1],
+            "price_team1": float(odds[0]) if len(odds) > 0 else None,
+            "price_team2": float(odds[1]) if len(odds) > 1 else None,
+            "price_draw": float(odds[2]) if len(odds) > 2 else None,
+            "match_url": url,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    return records
+
+
+async def main():
     async with Actor() as actor:
         input_data = await actor.get_input() or {}
-        max_matches = input_data.get("maxMatches", 200)
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-            page = await context.new_page()
-            all_records = []
-            for sport in STAKE_ESPORTS:
-                url = f"https://stake.com/sports/{sport['slug']}"
-                logger.info(f"Processing {sport['name']}...")
-                records = await scrape_stake_page(page, url, sport["name"], max_matches)
-                all_records.extend(records)
-            await browser.close()
-            for rec in all_records:
-                await actor.push_data(rec)
-            logger.info("Scrape complete. Total records: " + str(len(all_records)))
+        max_matches = input_data.get("maxMatches", 500)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+            )
+            page = await context.new_page()
+
+            all_records = []
+
+            for sport in STAKE_ESPORTS:
+                url = f"https://stake.com/sports/esports/{sport['slug']}" if sport["slug"] != "esports" else "https://stake.com/sports/esports"
+                try:
+                    records = await scrape_page(page, url, sport["name"])
+                    all_records.extend(records)
+                    logger.info(f"{sport['name']}: {len(records)} records")
+                except Exception as e:
+                    logger.error(f"Failed {sport['name']}: {e}")
+
+            await browser.close()
+
+        logger.info(f"Total records: {len(all_records)}")
+        for rec in all_records[:max_matches]:
+            await actor.push_data(rec)
+
+        await Actor.set_value("summary", {
+            "total": len(all_records),
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+        })
