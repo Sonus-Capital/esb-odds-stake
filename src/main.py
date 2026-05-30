@@ -1,8 +1,7 @@
 import asyncio
 import logging
-import re
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 from apify import Actor
 from playwright.async_api import async_playwright
@@ -38,52 +37,38 @@ async def scrape_page(page, url: str, sport_name: str) -> List[Dict]:
     html = await page.content()
     logger.info(f"Page HTML length: {len(html)}")
 
-    # Save debug snapshot
     await Actor.set_value(f"debug_html_{sport_name}", html, content_type="text/html")
     screenshot = await page.screenshot(full_page=True)
     await Actor.set_value(f"debug_screenshot_{sport_name}", screenshot, content_type="image/png")
 
-    # Extract via JS — look for odds-like numbers near team name text
     extracted = await page.evaluate("""() => {
         const results = [];
-        // Find all leaf text nodes containing decimal odds
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         const oddsPattern = /^\\d+\\.\\d{2,3}$/;
         let node;
         while (node = walker.nextNode()) {
             const text = node.textContent.trim();
             if (oddsPattern.test(text)) {
-                // Walk up to find a container with team info
                 let el = node.parentElement;
                 for (let i = 0; i < 8; i++) {
                     if (!el) break;
                     const inner = el.innerText || '';
                     const lines = inner.split('\\n').map(l => l.trim()).filter(l => l.length > 1);
-                    // Look for containers with 2+ non-odds text lines (team names)
                     const teamLines = lines.filter(l => !oddsPattern.test(l) && l.length > 2 && l.length < 50);
                     const oddsLines = lines.filter(l => oddsPattern.test(l));
                     if (teamLines.length >= 2 && oddsLines.length >= 2) {
-                        results.push({
-                            teams: teamLines.slice(0, 4),
-                            odds: oddsLines.slice(0, 3),
-                            raw: inner.substring(0, 200)
-                        });
+                        results.push({ teams: teamLines.slice(0, 4), odds: oddsLines.slice(0, 3), raw: inner.substring(0, 200) });
                         break;
                     }
                     el = el.parentElement;
                 }
             }
         }
-        // Deduplicate by raw text
         const seen = new Set();
-        return results.filter(r => {
-            if (seen.has(r.raw)) return false;
-            seen.add(r.raw);
-            return true;
-        });
+        return results.filter(r => { if (seen.has(r.raw)) return false; seen.add(r.raw); return true; });
     }""")
 
-    logger.info(f"{sport_name}: extracted {len(extracted)} raw market blocks")
+    logger.info(f"{sport_name}: {len(extracted)} market blocks found")
 
     for item in extracted:
         teams = item.get("teams", [])
@@ -121,7 +106,6 @@ async def main():
                 locale="en-US",
             )
             page = await context.new_page()
-
             all_records = []
 
             for sport in STAKE_ESPORTS:
@@ -139,7 +123,8 @@ async def main():
         for rec in all_records[:max_matches]:
             await actor.push_data(rec)
 
-        await Actor.set_value("summary", {
-            "total": len(all_records),
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
-        })
+        await Actor.set_value("summary", {"total": len(all_records), "scraped_at": datetime.now(timezone.utc).isoformat()})
+
+
+# Apify entrypoint — Actor.main handles the event loop
+Actor.main(main)
