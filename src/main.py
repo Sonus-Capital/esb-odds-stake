@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Stake.com Esports Odds Scraper — v5 (2026-05-30)
+Stake.com Esports Odds Scraper — v6 (2026-06-07)
+
+Schema: SCHEMA-LOCK-2026-06-07.md — all actors must conform.
+Changes in v6:
+  - game_raw extracted from tournament.category (actual game, not "esport")
+  - game field added (canonical via normalise_game)
 
 Uses fixtureList(sportType:esport, limit:50, offset:N) to get ALL esports
 fixtures in 3 paginated calls — 137 fixtures across 13 sports.
@@ -13,6 +18,7 @@ from typing import List, Dict, Optional
 
 import aiohttp
 from apify import Actor
+from normalise import normalise_game
 
 GQL_URL = "https://stake.com/_api/graphql"
 
@@ -56,6 +62,9 @@ query EsportsPage($offset: Int!) {
     tournament {
       name
       category {
+        id
+        name
+        slug
         sport { id name slug }
       }
     }
@@ -107,7 +116,9 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
     slug = fixture.get("slug", "")
     fdata = fixture.get("data") or {}
     tournament = fixture.get("tournament") or {}
-    sport_slug = (tournament.get("category") or {}).get("sport", {}).get("slug", "")
+    category = (tournament.get("category") or {})
+    game_raw = category.get("name", "")
+    sport_slug = category.get("sport", {}).get("slug", "")
     t_name = tournament.get("name", "")
 
     comps = [c.get("name", "") for c in fdata.get("competitors", [])]
@@ -168,7 +179,8 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
 
     return {
         "bookmaker": "stake",
-        "game_raw": sport_slug,
+        "game_raw": game_raw,
+        "game": normalise_game(game_raw),
         "tournament_name": t_name,
         "team1": team1,
         "team2": team2,
@@ -192,7 +204,7 @@ async def main() -> None:
         seen: set = set()
         proxy_idx = 0
 
-        actor.log.info(f"Stake GQL v5 | max={max_matches} | paginated fixtureList(sportType:esport)")
+        actor.log.info(f"Stake GQL v6 | schema-locked | max={max_matches} | paginated fixtureList(sportType:esport)")
 
         conn = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=30)
@@ -223,7 +235,7 @@ async def main() -> None:
                     seen.add(key)
                     records.append(rec)
                     page_records += 1
-                    sport = rec["game_raw"]
+                    sport = rec["game"] or rec["game_raw"]
                     by_sport[sport] = by_sport.get(sport, 0) + 1
 
                 actor.log.info(f"  {page_records} records | {by_sport}")
