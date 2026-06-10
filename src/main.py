@@ -18,7 +18,7 @@ from typing import List, Dict, Optional
 
 import aiohttp
 from apify import Actor
-from normalise import normalise_game
+from src.normalise import normalise_game
 
 GQL_URL = "https://stake.com/_api/graphql"
 
