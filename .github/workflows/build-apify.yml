@@ -1,0 +1,31 @@
+name: Build Apify Actor from Git
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Apify build
+        env:
+          APIFY_TOKEN: "${{ secrets.APIFY_TOKEN }}"
+          ACTOR_ID: gphxe6KKpvKqHz3dC
+        run: |
+          python3 - <<'PY'
+          import os, urllib.request, json
+          actor_id = os.environ['ACTOR_ID']
+          token = os.environ['APIFY_TOKEN']
+          url = f"https://api.apify.com/v2/actors/{actor_id}/builds?version=1.0&tag=latest"
+          req = urllib.request.Request(url, method='POST')
+          req.add_header('Authorization', f'Bearer {token}')
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(resp.read().decode())
+          except urllib.error.HTTPError as e:
+              print(e.read().decode())
+              raise
+          PY
