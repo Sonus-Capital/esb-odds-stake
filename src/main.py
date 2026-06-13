@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Stake.com Esports Odds Scraper — v6 (2026-06-07)
+Stake.com Esports Odds Scraper — v7 (2026-06-13)
 
 Schema: SCHEMA-LOCK-2026-06-07.md — all actors must conform.
-Changes in v6:
-  - game_raw extracted from tournament.category (actual game, not "esport")
-  - game field added (canonical via normalise_game)
+Changes in v7:
+  - game_raw extracted from tournament.category.sport.name (actual game, not "International")
+  - game field added (canonical via normalise_game, with raw fallback)
+  - pagination made more resilient: retry on failure, rotate proxy only when banned
 
-Uses fixtureList(sportType:esport, limit:50, offset:N) to get ALL esports
-fixtures in 3 paginated calls — 137 fixtures across 13 sports.
-No sport-by-sport traversal needed. Oxylabs residential proxy for CF bypass.
+Uses fixtureList(sportType:esport, limit:50, offset:N) to get all esports
+fixtures across paginated calls. Oxylabs residential proxy for CF bypass.
 """
 import asyncio
 import re
@@ -128,8 +128,12 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
     fdata = fixture.get("data") or {}
     tournament = fixture.get("tournament") or {}
     category = (tournament.get("category") or {})
-    game_raw = category.get("name", "")
-    sport_slug = category.get("sport", {}).get("slug", "")
+    sport_info = category.get("sport") or {}
+
+    # The actual esport title lives on the sport node, NOT category.name.
+    # category.name is usually "International" / regional, not the game.
+    game_raw = sport_info.get("name", "") or category.get("name", "")
+    sport_slug = sport_info.get("slug", "")
     t_name = tournament.get("name", "")
 
     comps = [c.get("name", "") for c in fdata.get("competitors", [])]
@@ -188,10 +192,12 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
     if p1 is None or p2 is None:
         return None
 
+    canonical_game = normalise_game(game_raw)
     return {
         "bookmaker": "stake",
         "game_raw": game_raw,
-        "game": normalise_game(game_raw),
+        "sport_slug": sport_slug,
+        "game": canonical_game if canonical_game else game_raw,
         "tournament_name": t_name,
         "team1": team1,
         "team2": team2,
@@ -205,6 +211,30 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
     }
 
 
+_proxy_state = {"idx": 0}
+
+
+async def gql_with_retry(session: aiohttp.ClientSession, query: str, variables: dict, actor, max_attempts: int = 3) -> dict:
+    """Run a GQL query; rotate to next proxy on CF block / HTTP error."""
+    last_err: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        proxy_idx = _proxy_state["idx"]
+        proxy = PROXY_LIST[proxy_idx % len(PROXY_LIST)]
+        actor.log.info(f"GQL attempt {attempt+1}/{max_attempts} offset={variables.get('offset')} via proxy #{proxy_idx % len(PROXY_LIST)}")
+        try:
+            data = await gql(session, query, variables, proxy)
+            # proxy worked — keep using it for the following requests
+            return data
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc)
+            actor.log.warning(f"  proxy failed: {msg[:120]}")
+            # rotate proxy and retry
+            _proxy_state["idx"] = (proxy_idx + 1) % len(PROXY_LIST)
+            await asyncio.sleep(min(2 ** attempt, 10))
+    raise last_err
+
+
 async def main() -> None:
     async with Actor() as actor:
         inp = await actor.get_input() or {}
@@ -213,29 +243,30 @@ async def main() -> None:
         now = datetime.now(timezone.utc).isoformat()
         records: List[Dict] = []
         seen: set = set()
-        proxy_idx = 0
 
-        actor.log.info(f"Stake GQL v6 | schema-locked | max={max_matches} | paginated fixtureList(sportType:esport)")
+        actor.log.info(f"Stake GQL v7 | schema-locked | max={max_matches} | paginated fixtureList(sportType:esport)")
 
         conn = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(headers=BASE_HEADERS, connector=conn, timeout=timeout) as session:
             offset = 0
             page = 0
-            while True:
-                proxy = PROXY_LIST[proxy_idx % len(PROXY_LIST)]
-                proxy_idx += 1
-                actor.log.info(f"Page {page+1}: offset={offset} via proxy #{(proxy_idx-1) % len(PROXY_LIST)}")
+            total_fixtures = 0
+            while len(records) < max_matches:
+                try:
+                    data = await gql_with_retry(session, Q_FIXTURE_PAGE, {"offset": offset}, actor)
+                except Exception as exc:
+                    actor.log.error(f"Gave up after retries at offset {offset}: {exc}")
+                    break
 
-                data = await gql(session, Q_FIXTURE_PAGE, {"offset": offset}, proxy)
                 fixtures = data.get("fixtureList", [])
-
                 if not fixtures:
                     actor.log.info("Empty page — done")
                     break
 
+                total_fixtures += len(fixtures)
                 page_records = 0
-                by_sport: dict = {}
+                by_game: dict = {}
                 for fx in fixtures:
                     rec = extract_match_winner(fx, now)
                     if not rec:
@@ -247,23 +278,24 @@ async def main() -> None:
                     records.append(rec)
                     page_records += 1
                     sport = rec["game"] or rec["game_raw"]
-                    by_sport[sport] = by_sport.get(sport, 0) + 1
+                    by_game[sport] = by_game.get(sport, 0) + 1
 
-                actor.log.info(f"  {page_records} records | {by_sport}")
+                actor.log.info(f"  page {page+1}: {page_records}/{len(fixtures)} usable | by_game={by_game}")
 
-                if len(fixtures) < 50 or len(records) >= max_matches:
+                if len(fixtures) < 50:
                     break
 
                 offset += 50
                 page += 1
                 await asyncio.sleep(0.5)
 
-        actor.log.info(f"Total: {len(records)} records")
+        actor.log.info(f"Total fixtures seen: {total_fixtures} | extracted: {len(records)}")
         for rec in records:
             await actor.push_data(rec)
         await actor.push_data({
             "_meta": True, "bookmaker": "stake",
             "records_total": len(records),
+            "fixtures_seen": total_fixtures,
             "method": "gql_fixture_list_paginated",
             "scraped_at": now,
         })
