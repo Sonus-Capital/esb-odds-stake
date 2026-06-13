@@ -42,8 +42,19 @@ BASE_HEADERS = {
 }
 
 PROXY_LIST = [
+    # Stake esport accepts: CA(Edmonton), IE(Dublin), FI(Helsinki), NO(Oslo), NZ(Auckland),
+    #     JP(Tokyo), PL(Warsaw), HU(Budapest), IS(Reykjavik), LU(Luxembourg), SG
+    # NOT accepted: US, GB, FR, DE, NL, AU, SE, AT, BE, CH, ES, IT, DK
     "http://customer-sonus_TbxLY-cc-ca-city-edmonton:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
-    "http://customer-sonus_TbxLY-cc-gb:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-ie-city-dublin:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-fi-city-helsinki:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-no-city-oslo:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-nz-city-auckland:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-jp-city-tokyo:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-pl-city-warsaw:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-hu-city-budapest:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-is-city-reykjavik:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
+    "http://customer-sonus_TbxLY-cc-lu:gX~dawV=8MzVzA@pr.oxylabs.io:7777",
     "http://numbnuts_9kOSG:~SWmnT7Qe~n7Fi@pr.oxylabs.io:7777",
 ]
 
