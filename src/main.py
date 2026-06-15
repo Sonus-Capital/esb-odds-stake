@@ -20,6 +20,24 @@ import aiohttp
 from apify import Actor
 from src.normalise import normalise_game
 
+
+def parse_stake_timestamp(ts: str) -> str:
+    """Stake fixtureList startTime often arrives as RFC 2822; normalise to ISO 8601 UTC."""
+    if not ts:
+        return ""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(ts)
+        # Convert aware datetime to UTC ISO string with +00:00
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+    # Fallback: try ISO / common formats
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).isoformat()
+    except Exception:
+        return ts
+
 GQL_URL = "https://stake.com/_api/graphql"
 
 BASE_HEADERS = {
@@ -144,7 +162,7 @@ def extract_match_winner(fixture: dict, now: str) -> Optional[Dict]:
         return None
     team1, team2 = comps[0], comps[1]
 
-    start_time = fdata.get("startTime", "")
+    start_time = parse_stake_timestamp(fdata.get("startTime", ""))
     match_url = f"https://stake.com/sports/esports/{slug}" if slug else ""
 
     best_market = None
