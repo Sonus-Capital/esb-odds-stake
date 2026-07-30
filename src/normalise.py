@@ -178,7 +178,16 @@ TOURNAMENT_GAME_KEYWORDS = {
     "united21": "Dota 2",
     "european pro league": "CS2",
     "bb rush": "CS2",
-    "esports world cup": "Esports",
+    # Generic 'esports world cup' → game disambiguation is impossible from the
+    # tournament name alone; the sync layer must keep game_raw in that case.
+    # (Removed the old '"esports world cup": "Esports"' mapping — it created the
+    # ESPO-bucket bug. EWC rows carry a per-game game_raw from every book.)
+    "lck cl": "League of Legends",
+    "vct pacific": "Valorant",
+    "vcl ": "Valorant",
+    "tp world championship": "CS2",
+    "berserk league": "Dota 2",
+    "kpl": "Honor of Kings",
 }
 
 # Normalised (game, tournament) -> canonical tournament name. Used to collapse
@@ -207,14 +216,23 @@ def _strip_game_prefix(tournament: str, game: str) -> str:
 
 
 def infer_game_from_tournament(tournament_name: str) -> Optional[str]:
-    """Return canonical game when tournament starts with a known game name/alias."""
+    """Return canonical game when tournament starts with a known game name/alias.
+
+    'Esports' is a generic bucket (betway/thunderpick emit it when the book
+    gives no per-game label), NOT a real game — it is excluded from prefix
+    matching so a bare 'Esports World Cup 2026' doesn't resolve to 'Esports'
+    before keyword inference gets a chance.
+    """
     if not tournament_name:
         return None
     t = tournament_name.strip().lower()
-    # Prefer longest/canonical matches first
-    candidates = [(c, c.lower()) for c in CANONICAL_GAMES]
+    # Prefer longest/canonical matches first (generic buckets excluded)
+    GENERIC = {"esports", "unknown", "none", ""}
+    candidates = [(c, c.lower()) for c in CANONICAL_GAMES if c.lower() not in GENERIC]
     aliases = {}
     for alias, canonical in KNOWN_ALIASES.items():
+        if canonical.lower() in GENERIC:
+            continue
         aliases.setdefault(canonical.lower(), []).append(alias.lower())
     for canonical, canon_lower in sorted(candidates, key=lambda x: -len(x[1])):
         patterns = {canon_lower}
